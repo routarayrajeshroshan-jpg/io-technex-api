@@ -250,4 +250,3 @@ def get_telemetry(
         "count": len(filtered_meters),
         "meters": filtered_meters,
     }
-```
