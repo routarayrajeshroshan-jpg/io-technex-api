@@ -1,16 +1,12 @@
 from datetime import datetime, timezone
-import random
+from threading import Lock
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-app = FastAPI(
-    title="IO Technex Smart EMS API",
-    version="1.0.0"
-)
+app = FastAPI(title="IO Technex Smart EMS API")
 
-# Allow your existing Vercel website to call this API.
-# We will restrict this to your website's domain for production.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -18,9 +14,19 @@ app.add_middleware(
         "http://localhost:5173",
     ],
     allow_credentials=False,
-    allow_methods=["GET"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
 )
+
+# Temporary in-memory storage for prototype testing.
+# Data is lost if the service restarts.
+storage_lock = Lock()
+latest_meters = []
+
+
+class TelemetryPayload(BaseModel):
+    data_source: str = "SIMULATED"
+    meters: list[dict]
 
 
 @app.get("/")
@@ -36,25 +42,38 @@ def health():
     return {"status": "healthy"}
 
 
-@app.get("/api/v1/telemetry")
-def get_telemetry():
-    meters = []
+@app.post("/api/v1/telemetry")
+def receive_telemetry(payload: TelemetryPayload):
+    global latest_meters
 
-    for index, meter_id in enumerate([35, 36, 37, 38, 39]):
-        meters.append({
-            "slave_id": meter_id,
-            "meter_name": f"PM800-{meter_id}",
-            "voltage": round(random.uniform(410, 425), 2),
-            "current": round(random.uniform(5, 25), 2),
-            "energy_kwh": round(
-                1000 + index * 500 + random.uniform(0, 5), 2
-            ),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "data_source": "SIMULATED"
-        })
+    if not payload.meters:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one meter reading is required"
+        )
+
+    with storage_lock:
+        latest_meters = payload.meters
 
     return {
-        "data_source": "SIMULATED",
+        "status": "success",
+        "message": "Telemetry received",
+        "count": len(payload.meters),
+        "data_source": payload.data_source
+    }
+
+
+@app.get("/api/v1/telemetry")
+def get_telemetry():
+    with storage_lock:
+        meters = list(latest_meters)
+
+    return {
+        "data_source": (
+            "SIMULATED"
+            if not meters
+            else "NODE_RED"
+        ),
         "count": len(meters),
         "meters": meters
     }
