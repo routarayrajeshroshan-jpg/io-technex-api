@@ -1,4 +1,3 @@
-```python
 import os
 import hmac
 from threading import Lock
