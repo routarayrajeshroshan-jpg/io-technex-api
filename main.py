@@ -236,64 +236,70 @@ def admin_check(claims: dict[str, Any] = Depends(require_admin)) -> dict[str, st
         "user_id": str(claims.get("sub", "")),
     }
 
-# --------------------------------------------------
 
+# --------------------------------------------------
 # ADMIN: DASHBOARD STATISTICS
-
 # --------------------------------------------------
-
 @app.get("/api/v1/admin/stats")
 def admin_stats(
-claims: dict[str, Any] = Depends(require_admin),
+    claims: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
-try:
-# Count registered customer profiles.
-customers_result = (
-supabase.table("profiles")
-.select("id", count="exact")
-.eq("role", "customer")
-.limit(1)
-.execute()
-)
+    try:
+        customers_result = (
+            supabase.table("profiles")
+            .select("id", count="exact")
+            .eq("role", "customer")
+            .limit(1)
+            .execute()
+        )
 
-    # Count factories.
-    factories_result = (
-        supabase.table("factories")
-        .select("id", count="exact")
-        .limit(1)
-        .execute()
-    )
+        factories_result = (
+            supabase.table("factories")
+            .select("id", count="exact")
+            .limit(1)
+            .execute()
+        )
 
-    # Count registered meters.
-    meters_result = (
-        supabase.table("factory_meters")
-        .select("id", count="exact")
-        .limit(1)
-        .execute()
-    )
+        meters_result = (
+            supabase.table("factory_meters")
+            .select("factory_id, slave_id", count="exact")
+            .limit(10000)
+            .execute()
+        )
 
-    with storage_lock:
-        readings = list(latest_meters.values())
+        # Online here means a registered meter has a reading in API memory.
+        # This does not yet enforce a recent last-seen time threshold.
+        registered_keys = {
+            (str(row["factory_id"]), int(row["slave_id"]))
+            for row in (meters_result.data or [])
+        }
 
-    # A meter is considered online if the API has a latest reading
-    # for its registered factory and slave ID.
-    online_keys = {
-        (str(reading.get("factory_id")), int(reading.get("slave_id", 0)))
-        for reading in readings
-    }
+        with storage_lock:
+            readings = list(latest_meters.values())
 
-    return {
-        "total_customers": customers_result.count or 0,
-        "total_factories": factories_result.count or 0,
-        "registered_meters": meters_result.count or 0,
-        "online_meters": len(online_keys),
-    }
+        online_keys = {
+            (str(reading.get("factory_id")), int(reading.get("slave_id", 0)))
+            for reading in readings
+            if (str(reading.get("factory_id")), int(reading.get("slave_id", 0)))
+            in registered_keys
+        }
 
-except Exception:
-    raise HTTPException(
-        status_code=503,
-        detail="Unable to retrieve dashboard statistics",
-    )
+        return {
+            "total_customers": customers_result.count or 0,
+            "total_factories": factories_result.count or 0,
+            "registered_meters": meters_result.count or 0,
+            "online_meters": len(online_keys),
+        }
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"Dashboard statistics error: {error}")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to retrieve dashboard statistics",
+        )
+
+
 # --------------------------------------------------
 # ADMIN: CREATE CUSTOMER
 # --------------------------------------------------
