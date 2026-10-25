@@ -93,6 +93,44 @@ def require_customer(
             status_code=401,
             detail="Invalid or expired login token",
         )
+def require_admin(
+    claims: dict = Depends(require_customer),
+):
+    user_id = claims.get("sub")
+
+    if not user_id:
+        raise HTTPException(
+            status_code=401,
+            detail="User ID missing from login token",
+        )
+
+    try:
+        result = (
+            supabase.table("profiles")
+            .select("role")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
+
+        profile = result.data
+
+        if not profile or profile.get("role") != "admin":
+            raise HTTPException(
+                status_code=403,
+                detail="Admin access required",
+            )
+
+        return claims
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to verify admin permissions",
+        )
 
 
 def require_node_red(
