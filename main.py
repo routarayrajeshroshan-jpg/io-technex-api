@@ -207,6 +207,11 @@ class CreateFactoryRequest(BaseModel):
     location: str
     customer_user_id: str
 
+class RegisterMeterRequest(BaseModel):
+    factory_id: str
+    slave_id: int
+    meter_name: str
+
 
 class TelemetryPayload(BaseModel):
     data_source: str = "SIMULATED"
