@@ -197,7 +197,10 @@ def get_assigned_meter_ids(factory_ids: list[str]) -> set[int]:
 # --------------------------------------------------
 # REQUEST MODEL
 # --------------------------------------------------
-
+class CreateCustomerRequest(BaseModel):
+    email: str
+    password: str
+    full_name: str
 class TelemetryPayload(BaseModel):
     data_source: str = "SIMULATED"
     meters: list[dict]
@@ -226,7 +229,68 @@ def admin_check(
         "message": "Admin access verified",
         "user_id": claims.get("sub"),
     }
+@app.post("/api/v1/admin/customers")
+def create_customer(
+    request: CreateCustomerRequest,
+    claims: dict = Depends(require_admin),
+):
+    email = request.email.strip().lower()
+    password = request.password
+    full_name = request.full_name.strip()
 
+    if not email or not full_name or len(password) < 12:
+        raise HTTPException(
+            status_code=400,
+            detail="Email and name are required; password must be at least 12 characters",
+        )
+
+    try:
+        result = supabase.auth.admin.create_user({
+            "email": email,
+            "password": password,
+            "email_confirm": False,
+            "user_metadata": {
+                "full_name": full_name
+            },
+        })
+
+        user = result.user
+
+        if not user:
+            raise HTTPException(
+                status_code=500,
+                detail="Customer account creation failed",
+            )
+
+        profile_result = (
+            supabase.table("profiles")
+            .upsert({
+                "id": user.id,
+                "full_name": full_name,
+                "role": "customer",
+            })
+            .execute()
+        )
+
+        return {
+            "status": "success",
+            "message": "Customer account created",
+            "customer": {
+                "id": user.id,
+                "email": user.email,
+                "full_name": full_name,
+                "role": "customer",
+            },
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to create customer. Check whether the email already exists and verify Supabase configuration.",
+        )
 # --------------------------------------------------
 # RECEIVE NODE-RED TELEMETRY
 # --------------------------------------------------
