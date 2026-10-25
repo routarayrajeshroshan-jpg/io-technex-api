@@ -298,6 +298,88 @@ def create_customer(
             status_code=400,
             detail="Unable to create customer. Check whether the email already exists and verify Supabase configuration.",
         )
+
+class CreateFactoryRequest(BaseModel):
+    name: str
+    location: str
+    customer_user_id: str
+
+
+@app.post("/api/v1/admin/factories")
+def create_factory(
+    request: CreateFactoryRequest,
+    claims: dict = Depends(require_admin),
+):
+    name = request.name.strip()
+    location = request.location.strip()
+    customer_user_id = request.customer_user_id.strip()
+
+    if not name or not location or not customer_user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Factory name, location, and customer user ID are required",
+        )
+
+    try:
+        # Verify the customer exists and has the customer role.
+        profile_result = (
+            supabase.table("profiles")
+            .select("id, role")
+            .eq("id", customer_user_id)
+            .single()
+            .execute()
+        )
+
+        profile = profile_result.data
+
+        if not profile or profile.get("role") != "customer":
+            raise HTTPException(
+                status_code=400,
+                detail="A valid customer account is required",
+            )
+
+        # Create the factory.
+        factory_result = (
+            supabase.table("factories")
+            .insert({
+                "name": name,
+                "location": location,
+            })
+            .execute()
+        )
+
+        if not factory_result.data:
+            raise HTTPException(
+                status_code=500,
+                detail="Factory creation failed",
+            )
+
+        factory = factory_result.data[0]
+
+        # Assign the customer to the factory.
+        supabase.table("factory_users").insert({
+            "factory_id": factory["id"],
+            "user_id": customer_user_id,
+        }).execute()
+
+        return {
+            "status": "success",
+            "message": "Factory created and customer assigned",
+            "factory": {
+                "id": factory["id"],
+                "name": factory["name"],
+                "location": factory["location"],
+            },
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to create factory or assign customer",
+        )
 # --------------------------------------------------
 # RECEIVE NODE-RED TELEMETRY
 # --------------------------------------------------
