@@ -201,6 +201,13 @@ class CreateCustomerRequest(BaseModel):
     email: str
     password: str
     full_name: str
+
+class CreateFactoryRequest(BaseModel):
+    name: str
+    location: str
+    customer_user_id: str
+
+
 class TelemetryPayload(BaseModel):
     data_source: str = "SIMULATED"
     meters: list[dict]
