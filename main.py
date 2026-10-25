@@ -217,7 +217,15 @@ def home():
 @app.get("/health")
 def health():
     return {"status": "healthy"}
-
+@app.get("/api/v1/admin/check")
+def admin_check(
+    claims: dict = Depends(require_admin),
+):
+    return {
+        "status": "success",
+        "message": "Admin access verified",
+        "user_id": claims.get("sub"),
+    }
 
 # --------------------------------------------------
 # RECEIVE NODE-RED TELEMETRY
