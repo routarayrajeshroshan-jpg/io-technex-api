@@ -377,6 +377,64 @@ def create_factory(
             },
         }
 
+    @app.post("/api/v1/admin/meters")
+def register_meter(
+    request: RegisterMeterRequest,
+    claims: dict = Depends(require_admin),
+):
+    factory_id = request.factory_id.strip()
+    meter_name = request.meter_name.strip()
+    slave_id = request.slave_id
+
+    if not factory_id or not meter_name or not 1 <= slave_id <= 247:
+        raise HTTPException(
+            status_code=400,
+            detail="Valid factory ID, meter name, and Modbus slave ID are required",
+        )
+
+    try:
+        # Verify that the factory exists.
+        factory_result = (
+            supabase.table("factories")
+            .select("id")
+            .eq("id", factory_id)
+            .execute()
+        )
+
+        if not factory_result.data:
+            raise HTTPException(
+                status_code=404,
+                detail="Factory not found",
+            )
+
+        # Register the meter.
+        result = (
+            supabase.table("factory_meters")
+            .insert({
+                "factory_id": factory_id,
+                "slave_id": slave_id,
+                "meter_name": meter_name,
+            })
+            .execute()
+        )
+
+        meter = result.data[0]
+
+        return {
+            "status": "success",
+            "message": "Meter registered",
+            "meter": meter,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to register meter. Check for a duplicate slave ID in this factory.",
+        )
+
     except HTTPException:
         raise
 
