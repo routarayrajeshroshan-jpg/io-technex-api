@@ -236,7 +236,64 @@ def admin_check(claims: dict[str, Any] = Depends(require_admin)) -> dict[str, st
         "user_id": str(claims.get("sub", "")),
     }
 
+# --------------------------------------------------
 
+# ADMIN: DASHBOARD STATISTICS
+
+# --------------------------------------------------
+
+@app.get("/api/v1/admin/stats")
+def admin_stats(
+claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+try:
+# Count registered customer profiles.
+customers_result = (
+supabase.table("profiles")
+.select("id", count="exact")
+.eq("role", "customer")
+.limit(1)
+.execute()
+)
+
+    # Count factories.
+    factories_result = (
+        supabase.table("factories")
+        .select("id", count="exact")
+        .limit(1)
+        .execute()
+    )
+
+    # Count registered meters.
+    meters_result = (
+        supabase.table("factory_meters")
+        .select("id", count="exact")
+        .limit(1)
+        .execute()
+    )
+
+    with storage_lock:
+        readings = list(latest_meters.values())
+
+    # A meter is considered online if the API has a latest reading
+    # for its registered factory and slave ID.
+    online_keys = {
+        (str(reading.get("factory_id")), int(reading.get("slave_id", 0)))
+        for reading in readings
+    }
+
+    return {
+        "total_customers": customers_result.count or 0,
+        "total_factories": factories_result.count or 0,
+        "registered_meters": meters_result.count or 0,
+        "online_meters": len(online_keys),
+    }
+
+except Exception:
+    raise HTTPException(
+        status_code=503,
+        detail="Unable to retrieve dashboard statistics",
+    )
 # --------------------------------------------------
 # ADMIN: CREATE CUSTOMER
 # --------------------------------------------------
