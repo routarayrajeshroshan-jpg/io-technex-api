@@ -303,6 +303,42 @@ def admin_stats(
 # --------------------------------------------------
 # ADMIN: CREATE CUSTOMER
 # --------------------------------------------------
+@app.get("/api/v1/admin/customers")
+def list_customers(
+    claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """List customer profiles and match email addresses from Supabase Auth."""
+    try:
+        profiles_result = (
+            supabase.table("profiles")
+            .select("id, full_name, role, created_at")
+            .eq("role", "customer")
+            .order("created_at", desc=True)
+            .execute()
+        )
+        profiles = profiles_result.data or []
+
+        # profiles does not store email, so retrieve it from Supabase Auth.
+        auth_result = supabase.auth.admin.list_users()
+        auth_users = getattr(auth_result, "users", auth_result)
+        email_by_id = {
+            str(getattr(auth_user, "id", "")): getattr(auth_user, "email", None)
+            for auth_user in (auth_users or [])
+        }
+
+        customers = [
+            {**profile, "email": email_by_id.get(str(profile.get("id")))}
+            for profile in profiles
+        ]
+        return {"customers": customers, "count": len(customers)}
+    except Exception as error:
+        print(f"List customers error: {error}")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to retrieve customers. Check Supabase configuration.",
+        )
+
+
 @app.post("/api/v1/admin/customers", status_code=201)
 def create_customer(
     request: CreateCustomerRequest,
@@ -319,7 +355,7 @@ def create_customer(
             {
                 "email": email,
                 "password": request.password,
-                "email_confirm": False,
+                "email_confirm": True,
                 "user_metadata": {"full_name": full_name},
             }
         )
@@ -354,7 +390,7 @@ def create_customer(
 
         return {
             "status": "success",
-            "message": "Customer account created. Email confirmation/invitation setup may still be required.",
+            "message": "Customer account created. Share the initial password securely and ask the customer to change it after signing in.",
             "customer": {
                 "id": user.id,
                 "email": user.email,
