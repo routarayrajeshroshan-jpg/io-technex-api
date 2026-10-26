@@ -408,6 +408,85 @@ def create_customer(
 
 
 # --------------------------------------------------
+# ADMIN: LIST FACTORIES WITH ASSIGNED CUSTOMER
+# --------------------------------------------------
+@app.get("/api/v1/admin/factories")
+def list_factories(
+    claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """List factories and include the first assigned customer's details."""
+    try:
+        factories_result = (
+            supabase.table("factories")
+            .select("id, name, location, created_at")
+            .order("created_at", desc=True)
+            .execute()
+        )
+        factories = factories_result.data or []
+
+        if not factories:
+            return {"factories": [], "count": 0}
+
+        factory_ids = [str(factory["id"]) for factory in factories]
+        assignments_result = (
+            supabase.table("factory_users")
+            .select("factory_id, user_id")
+            .in_("factory_id", factory_ids)
+            .execute()
+        )
+        assignments = assignments_result.data or []
+        user_ids = list({str(row["user_id"]) for row in assignments if row.get("user_id")})
+
+        profile_by_id: dict[str, dict[str, Any]] = {}
+        if user_ids:
+            profiles_result = (
+                supabase.table("profiles")
+                .select("id, full_name, role")
+                .in_("id", user_ids)
+                .execute()
+            )
+            profile_by_id = {
+                str(profile["id"]): profile
+                for profile in (profiles_result.data or [])
+            }
+
+        # Email is managed by Supabase Auth, not the profiles table.
+        auth_result = supabase.auth.admin.list_users()
+        auth_users = getattr(auth_result, "users", auth_result)
+        email_by_id = {
+            str(getattr(auth_user, "id", "")): getattr(auth_user, "email", None)
+            for auth_user in (auth_users or [])
+        }
+
+        assignments_by_factory: dict[str, list[dict[str, Any]]] = {}
+        for assignment in assignments:
+            factory_key = str(assignment.get("factory_id", ""))
+            user_key = str(assignment.get("user_id", ""))
+            profile = profile_by_id.get(user_key, {})
+            assignments_by_factory.setdefault(factory_key, []).append({
+                "id": user_key,
+                "full_name": profile.get("full_name") or "Unnamed customer",
+                "email": email_by_id.get(user_key),
+            })
+
+        output = []
+        for factory in factories:
+            item = dict(factory)
+            assigned = assignments_by_factory.get(str(factory.get("id")), [])
+            item["customers"] = assigned
+            item["customer"] = assigned[0] if assigned else None
+            output.append(item)
+
+        return {"factories": output, "count": len(output)}
+    except Exception as error:
+        print(f"List factories error: {error}")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to retrieve factories. Check factories, factory_users, profiles, and Supabase Auth configuration.",
+        )
+
+
+# --------------------------------------------------
 # ADMIN: CREATE FACTORY AND ASSIGN CUSTOMER
 # --------------------------------------------------
 @app.post("/api/v1/admin/factories", status_code=201)
