@@ -1,5 +1,6 @@
 import os
 import hmac
+from datetime import datetime, timezone, timedelta
 from threading import Lock
 from functools import lru_cache
 from typing import Any
@@ -277,12 +278,17 @@ def admin_stats(
         with storage_lock:
             readings = list(latest_meters.values())
 
-        online_keys = {
-            (str(reading.get("factory_id")), int(reading.get("slave_id", 0)))
-            for reading in readings
-            if (str(reading.get("factory_id")), int(reading.get("slave_id", 0)))
-            in registered_keys
-        }
+        online_cutoff = datetime.now(timezone.utc) - timedelta(seconds=120)
+        online_keys = set()
+        for reading in readings:
+            key = (str(reading.get("factory_id")), int(reading.get("slave_id", 0)))
+            last_seen = reading.get("last_seen")
+            try:
+                seen_at = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                continue
+            if key in registered_keys and seen_at >= online_cutoff:
+                online_keys.add(key)
 
         return {
             "total_customers": customers_result.count or 0,
@@ -621,6 +627,81 @@ def register_meter(
 
 
 # --------------------------------------------------
+# ADMIN: LIST REGISTERED METERS WITH LATEST TELEMETRY
+# --------------------------------------------------
+@app.get("/api/v1/admin/meters")
+def list_admin_meters(
+    claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """Return registered meters, factory details, and recent in-memory readings."""
+    try:
+        meter_result = (
+            supabase.table("factory_meters")
+            .select("factory_id, slave_id, meter_name")
+            .order("slave_id")
+            .execute()
+        )
+        registered = meter_result.data or []
+        if not registered:
+            return {"meters": [], "count": 0}
+
+        factory_ids = list({str(row["factory_id"]) for row in registered})
+        factory_result = (
+            supabase.table("factories")
+            .select("id, name, location")
+            .in_("id", factory_ids)
+            .execute()
+        )
+        factory_by_id = {
+            str(factory["id"]): factory for factory in (factory_result.data or [])
+        }
+
+        with storage_lock:
+            readings_by_key = dict(latest_meters)
+
+        now = datetime.now(timezone.utc)
+        online_cutoff = now - timedelta(seconds=120)
+        output = []
+        for row in registered:
+            factory_id = str(row["factory_id"])
+            slave_id = int(row["slave_id"])
+            reading = readings_by_key.get((factory_id, slave_id), {})
+            last_seen = reading.get("last_seen")
+            try:
+                seen_at = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+                is_online = seen_at >= online_cutoff
+            except (TypeError, ValueError):
+                is_online = False
+
+            factory = factory_by_id.get(factory_id, {})
+            item = {
+                "factory_id": factory_id,
+                "factory_name": factory.get("name", "Unknown factory"),
+                "factory_location": factory.get("location", ""),
+                "slave_id": slave_id,
+                "meter_name": row.get("meter_name") or f"Meter {slave_id}",
+                "status": "online" if is_online else "offline",
+                "last_seen": last_seen,
+                "data_source": reading.get("data_source"),
+            }
+            # Include only known telemetry values, avoiding internal metadata duplication.
+            for key, value in reading.items():
+                if key not in {"factory_id", "slave_id", "meter_name", "last_seen", "data_source"}:
+                    item[key] = value
+            output.append(item)
+
+        return {"meters": output, "count": len(output)}
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"List meters error: {error}")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to retrieve meters. Check factory_meters and factories tables.",
+        )
+
+
+# --------------------------------------------------
 # RECEIVE NODE-RED TELEMETRY
 # --------------------------------------------------
 @app.post("/api/v1/telemetry", status_code=202)
@@ -680,6 +761,7 @@ def receive_telemetry(
         seen_ids.add(slave_id)
         reading["factory_id"] = factory_id
         reading["data_source"] = payload.data_source
+        reading["last_seen"] = datetime.now(timezone.utc).isoformat()
         normalized_readings.append(reading)
 
     with storage_lock:
