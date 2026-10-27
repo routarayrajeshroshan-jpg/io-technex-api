@@ -225,6 +225,17 @@ class UpdateFactoryRequest(BaseModel):
     customer_user_id: str = Field(min_length=1, max_length=100)
 
 
+class AlarmSettingsRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    factory_id: str = Field(min_length=1, max_length=100)
+    scope: str = Field(pattern="^(factory|meter)$")
+    slave_id: int | None = Field(default=None, ge=1, le=247)
+    high_current_limit_a: float = Field(gt=0, le=100000)
+    low_voltage_limit_v: float = Field(ge=0, le=100000)
+    high_voltage_limit_v: float = Field(gt=0, le=100000)
+    meter_offline_seconds: int = Field(ge=15, le=86400)
+
+
 class UpdateMeterRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     factory_id: str = Field(min_length=1, max_length=100)
@@ -317,30 +328,63 @@ def _set_alarm_condition(
         }).eq("id", existing["id"]).execute()
 
 
+def get_effective_alarm_settings(factory_id: str, slave_id: int | None = None) -> dict[str, Any]:
+    """Return meter override, then factory defaults, then Render environment defaults."""
+    settings = {
+        "high_current_limit_a": HIGH_CURRENT_LIMIT_A,
+        "low_voltage_limit_v": LOW_VOLTAGE_LIMIT_V,
+        "high_voltage_limit_v": HIGH_VOLTAGE_LIMIT_V,
+        "meter_offline_seconds": METER_OFFLINE_SECONDS,
+    }
+    try:
+        result = (
+            supabase.table("alarm_settings")
+            .select("factory_id, slave_id, high_current_limit_a, low_voltage_limit_v, high_voltage_limit_v, meter_offline_seconds")
+            .eq("factory_id", factory_id)
+            .execute()
+        )
+        rows = result.data or []
+        factory_row = next((row for row in rows if row.get("slave_id") is None), None)
+        meter_row = next((row for row in rows if slave_id is not None and row.get("slave_id") is not None and int(row["slave_id"]) == int(slave_id)), None)
+        for row in (factory_row, meter_row):
+            if row:
+                for key in settings:
+                    if row.get(key) is not None:
+                        settings[key] = row[key]
+    except Exception as error:
+        # Missing migration/table must not crash telemetry; environment defaults remain active.
+        print(f"Alarm settings lookup failed; using defaults: {error}")
+    return settings
+
+
 def evaluate_reading_alarms(factory_id: str, reading: dict[str, Any]) -> None:
-    """Evaluate current and voltage alarms for a validated registered meter."""
+    """Evaluate current and voltage alarms using meter override/factory/default limits."""
     slave_id = int(reading["slave_id"])
     meter_name = str(reading.get("meter_name") or f"Meter {slave_id}")
+    limits = get_effective_alarm_settings(factory_id, slave_id)
+    high_current_limit = float(limits["high_current_limit_a"])
+    low_voltage_limit = float(limits["low_voltage_limit_v"])
+    high_voltage_limit = float(limits["high_voltage_limit_v"])
 
     current = _numeric_reading(reading, "current", "current_a", "current_A", "amps", "Current")
     if current is not None:
         _set_alarm_condition(
             factory_id, slave_id, meter_name, "HIGH_CURRENT",
-            f"{meter_name}: current {current:g} A exceeds limit {HIGH_CURRENT_LIMIT_A:g} A",
-            current, HIGH_CURRENT_LIMIT_A, current > HIGH_CURRENT_LIMIT_A,
+            f"{meter_name}: current {current:g} A exceeds limit {high_current_limit:g} A",
+            current, high_current_limit, current > high_current_limit,
         )
 
     voltage = _numeric_reading(reading, "voltage", "voltage_v", "voltage_V", "Voltage")
     if voltage is not None:
         _set_alarm_condition(
             factory_id, slave_id, meter_name, "LOW_VOLTAGE",
-            f"{meter_name}: voltage {voltage:g} V is below limit {LOW_VOLTAGE_LIMIT_V:g} V",
-            voltage, LOW_VOLTAGE_LIMIT_V, voltage < LOW_VOLTAGE_LIMIT_V,
+            f"{meter_name}: voltage {voltage:g} V is below limit {low_voltage_limit:g} V",
+            voltage, low_voltage_limit, voltage < low_voltage_limit,
         )
         _set_alarm_condition(
             factory_id, slave_id, meter_name, "HIGH_VOLTAGE",
-            f"{meter_name}: voltage {voltage:g} V exceeds limit {HIGH_VOLTAGE_LIMIT_V:g} V",
-            voltage, HIGH_VOLTAGE_LIMIT_V, voltage > HIGH_VOLTAGE_LIMIT_V,
+            f"{meter_name}: voltage {voltage:g} V exceeds limit {high_voltage_limit:g} V",
+            voltage, high_voltage_limit, voltage > high_voltage_limit,
         )
 
 
@@ -362,11 +406,14 @@ def refresh_offline_alarms(factory_ids: list[str]) -> None:
     with storage_lock:
         readings = dict(latest_meters)
 
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=METER_OFFLINE_SECONDS)
+    now = datetime.now(timezone.utc)
     for meter in registered:
         factory_id = str(meter["factory_id"])
         slave_id = int(meter["slave_id"])
         meter_name = str(meter.get("meter_name") or f"Meter {slave_id}")
+        limits = get_effective_alarm_settings(factory_id, slave_id)
+        offline_seconds = int(limits["meter_offline_seconds"])
+        cutoff = now - timedelta(seconds=offline_seconds)
         reading = readings.get((factory_id, slave_id), {})
         last_seen = reading.get("last_seen")
         try:
@@ -378,8 +425,8 @@ def refresh_offline_alarms(factory_ids: list[str]) -> None:
         _set_alarm_condition(
             factory_id, slave_id, meter_name, "METER_OFFLINE",
             (f"{meter_name}: no telemetry received for at least "
-             f"{METER_OFFLINE_SECONDS} seconds"),
-            None, float(METER_OFFLINE_SECONDS), offline,
+             f"{offline_seconds} seconds"),
+            None, float(offline_seconds), offline,
         )
 
 
@@ -1221,6 +1268,125 @@ def get_telemetry(
     }
 
 # --------------------------------------------------
+# ADMIN: ALARM THRESHOLD CONFIGURATION
+# --------------------------------------------------
+@app.get("/api/v1/admin/alarm-settings")
+def list_alarm_settings(
+    factory_id: str,
+    claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """List configured factory defaults and meter-specific overrides."""
+    factory_id = validate_uuid(factory_id, "factory ID")
+    try:
+        factory_result = supabase.table("factories").select("id, name").eq("id", factory_id).maybe_single().execute()
+        if not factory_result.data:
+            raise HTTPException(status_code=404, detail="Factory not found")
+        settings_result = (
+            supabase.table("alarm_settings")
+            .select("id, factory_id, slave_id, high_current_limit_a, low_voltage_limit_v, high_voltage_limit_v, meter_offline_seconds, updated_at")
+            .eq("factory_id", factory_id)
+            .order("slave_id")
+            .execute()
+        )
+        meters_result = (
+            supabase.table("factory_meters")
+            .select("factory_id, slave_id, meter_name")
+            .eq("factory_id", factory_id)
+            .order("slave_id")
+            .execute()
+        )
+        return {
+            "factory": factory_result.data,
+            "settings": settings_result.data or [],
+            "meters": meters_result.data or [],
+            "environment_defaults": {
+                "high_current_limit_a": HIGH_CURRENT_LIMIT_A,
+                "low_voltage_limit_v": LOW_VOLTAGE_LIMIT_V,
+                "high_voltage_limit_v": HIGH_VOLTAGE_LIMIT_V,
+                "meter_offline_seconds": METER_OFFLINE_SECONDS,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"List alarm settings error: {error}")
+        raise HTTPException(status_code=503, detail="Unable to retrieve alarm settings. Run the alarm_settings SQL migration first.")
+
+
+@app.put("/api/v1/admin/alarm-settings")
+def save_alarm_settings(
+    request: AlarmSettingsRequest,
+    claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """Create or update a factory-wide default or a meter-specific override."""
+    factory_id = validate_uuid(request.factory_id, "factory ID")
+    if request.low_voltage_limit_v >= request.high_voltage_limit_v:
+        raise HTTPException(status_code=400, detail="Low voltage limit must be lower than high voltage limit")
+    if request.scope == "factory" and request.slave_id is not None:
+        raise HTTPException(status_code=400, detail="Factory-wide settings must not include a slave ID")
+    if request.scope == "meter" and request.slave_id is None:
+        raise HTTPException(status_code=400, detail="Select a meter for meter-specific settings")
+    try:
+        factory_result = supabase.table("factories").select("id").eq("id", factory_id).maybe_single().execute()
+        if not factory_result.data:
+            raise HTTPException(status_code=404, detail="Factory not found")
+        if request.scope == "meter":
+            meter_result = (supabase.table("factory_meters").select("slave_id")
+                            .eq("factory_id", factory_id).eq("slave_id", request.slave_id)
+                            .maybe_single().execute())
+            if not meter_result.data:
+                raise HTTPException(status_code=404, detail="Meter is not registered to this factory")
+        row = {
+            "factory_id": factory_id,
+            "slave_id": request.slave_id if request.scope == "meter" else None,
+            "high_current_limit_a": request.high_current_limit_a,
+            "low_voltage_limit_v": request.low_voltage_limit_v,
+            "high_voltage_limit_v": request.high_voltage_limit_v,
+            "meter_offline_seconds": request.meter_offline_seconds,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        query = supabase.table("alarm_settings").select("id").eq("factory_id", factory_id)
+        query = query.eq("slave_id", request.slave_id) if request.scope == "meter" else query.is_("slave_id", "null")
+        existing_result = query.maybe_single().execute()
+        if existing_result.data:
+            saved_result = supabase.table("alarm_settings").update(row).eq("id", existing_result.data["id"]).execute()
+        else:
+            saved_result = supabase.table("alarm_settings").insert(row).execute()
+        saved = (saved_result.data or [row])[0]
+        return {"status": "success", "message": "Alarm thresholds saved", "settings": saved}
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"Save alarm settings error: {error}")
+        raise HTTPException(status_code=503, detail="Unable to save alarm settings. Check the alarm_settings table and migration.")
+
+
+@app.delete("/api/v1/admin/alarm-settings")
+def delete_alarm_settings(
+    factory_id: str,
+    scope: str,
+    slave_id: int | None = None,
+    claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """Delete an override so thresholds fall back to the factory/default values."""
+    factory_id = validate_uuid(factory_id, "factory ID")
+    if scope not in {"factory", "meter"}:
+        raise HTTPException(status_code=400, detail="Scope must be factory or meter")
+    if scope == "meter" and slave_id is None:
+        raise HTTPException(status_code=400, detail="Meter slave ID is required")
+    if scope == "factory" and slave_id is not None:
+        raise HTTPException(status_code=400, detail="Factory scope must not include a slave ID")
+    try:
+        query = supabase.table("alarm_settings").delete().eq("factory_id", factory_id)
+        query = query.eq("slave_id", slave_id) if scope == "meter" else query.is_("slave_id", "null")
+        query.execute()
+        return {"status": "success", "message": "Custom thresholds removed; inherited defaults now apply"}
+    except Exception as error:
+        print(f"Delete alarm settings error: {error}")
+        raise HTTPException(status_code=503, detail="Unable to remove custom alarm settings")
+
+
+# --------------------------------------------------
 # ALARMS: ADMIN LIST / CUSTOMER LIST / ACKNOWLEDGE
 # --------------------------------------------------
 @app.get("/api/v1/admin/alarms")
@@ -1322,4 +1488,3 @@ def acknowledge_alarm(
     except Exception as error:
         print(f"Acknowledge alarm error: {error}")
         raise HTTPException(status_code=503, detail="Unable to acknowledge alarm")
-
