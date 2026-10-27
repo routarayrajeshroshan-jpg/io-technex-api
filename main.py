@@ -30,7 +30,7 @@ NODE_RED_API_KEY = os.environ["NODE_RED_API_KEY"]
 INFLUXDB_URL = os.getenv("INFLUXDB_URL", "https://us-east-1-1.aws.cloud2.influxdata.com").rstrip("/")
 INFLUXDB_ORG = os.getenv("INFLUXDB_ORG", "asianpaints")
 INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET", "asianpaints_utility_smartems")
-INFLUXDB_TOKEN = os.getenv("x2QrYtwF01-MNmxKF2A93aexkvwIHLV_lXWT-0f2iS_xKjuoVle0zWfu4p2Z_I4UYyeI7itglCzAbqKizFGnpw==", "")
+INFLUXDB_TOKEN = os.getenv("INFLUXDB_TOKEN", "")
 ANALYTICS_TIMEZONE = os.getenv("ANALYTICS_TIMEZONE", "Asia/Kolkata")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
