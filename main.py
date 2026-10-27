@@ -1,13 +1,10 @@
 import os
 import hmac
-from datetime import date, datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta
 from threading import Lock
 from functools import lru_cache
 from typing import Any
 from uuid import UUID
-from zoneinfo import ZoneInfo
-
-from influxdb_client import InfluxDBClient
 
 import jwt
 from jwt import PyJWKClient
@@ -25,13 +22,6 @@ from pydantic import BaseModel, Field, ConfigDict
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"]
 NODE_RED_API_KEY = os.environ["NODE_RED_API_KEY"]
-
-# InfluxDB 2.x settings. Configure these in Render Environment.
-INFLUXDB_URL = os.getenv("INFLUXDB_URL", "https://us-east-1-1.aws.cloud2.influxdata.com").rstrip("/")
-INFLUXDB_ORG = os.getenv("INFLUXDB_ORG", "asianpaints")
-INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET", "asianpaints_utility_smartems")
-INFLUXDB_TOKEN = os.getenv("INFLUXDB_TOKEN", "")
-ANALYTICS_TIMEZONE = os.getenv("ANALYTICS_TIMEZONE", "Asia/Kolkata")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
@@ -53,7 +43,7 @@ app.add_middleware(
         "http://localhost:5174",
     ],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
 
@@ -205,6 +195,26 @@ class CreateFactoryRequest(BaseModel):
 
 
 class RegisterMeterRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    factory_id: str = Field(min_length=1, max_length=100)
+    slave_id: int = Field(ge=1, le=247)
+    meter_name: str = Field(min_length=1, max_length=120)
+
+
+class UpdateCustomerRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    email: str = Field(min_length=3, max_length=254)
+    full_name: str = Field(min_length=1, max_length=120)
+
+
+class UpdateFactoryRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    name: str = Field(min_length=1, max_length=120)
+    location: str = Field(min_length=1, max_length=200)
+    customer_user_id: str = Field(min_length=1, max_length=100)
+
+
+class UpdateMeterRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     factory_id: str = Field(min_length=1, max_length=100)
     slave_id: int = Field(ge=1, le=247)
@@ -711,6 +721,217 @@ def list_admin_meters(
         )
 
 
+
+# --------------------------------------------------
+# ADMIN: UPDATE CUSTOMER / FACTORY / METER
+# --------------------------------------------------
+@app.put("/api/v1/admin/customers/{customer_id}")
+def update_admin_customer(
+    customer_id: str,
+    request: UpdateCustomerRequest,
+    claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    customer_id = validate_uuid(customer_id, "customer ID")
+    full_name = request.full_name.strip()
+    email = request.email.strip().lower()
+    if not full_name or "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid customer name and email are required")
+    try:
+        profile = (supabase.table("profiles").select("id, role")
+                   .eq("id", customer_id).maybe_single().execute()).data
+        if not profile or profile.get("role") != "customer":
+            raise HTTPException(status_code=404, detail="Customer not found")
+        # Email belongs to Supabase Auth; keep profile name in sync as well.
+        supabase.auth.admin.update_user_by_id(
+            customer_id,
+            {"email": email, "user_metadata": {"full_name": full_name}},
+        )
+        supabase.table("profiles").update({"full_name": full_name}).eq("id", customer_id).eq("role", "customer").execute()
+        return {"status": "success", "message": "Customer details updated"}
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"Update customer error: {error}")
+        raise HTTPException(status_code=400, detail="Unable to update customer. Check email uniqueness and Supabase Auth configuration.")
+
+
+@app.put("/api/v1/admin/factories/{factory_id}")
+def update_admin_factory(
+    factory_id: str,
+    request: UpdateFactoryRequest,
+    claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    factory_id = validate_uuid(factory_id, "factory ID")
+    name = request.name.strip()
+    location = request.location.strip()
+    customer_user_id = validate_uuid(request.customer_user_id.strip(), "customer user ID")
+    if not name or not location:
+        raise HTTPException(status_code=400, detail="Factory name and location are required")
+    try:
+        existing = (supabase.table("factories").select("id")
+                    .eq("id", factory_id).maybe_single().execute()).data
+        if not existing:
+            raise HTTPException(status_code=404, detail="Factory not found")
+        customer = (supabase.table("profiles").select("id, role")
+                    .eq("id", customer_user_id).maybe_single().execute()).data
+        if not customer or customer.get("role") != "customer":
+            raise HTTPException(status_code=400, detail="A valid customer account is required")
+        supabase.table("factories").update({"name": name, "location": location}).eq("id", factory_id).execute()
+        assignments = (supabase.table("factory_users").select("user_id")
+                      .eq("factory_id", factory_id).execute()).data or []
+        assigned_ids = {str(row.get("user_id")) for row in assignments}
+        if customer_user_id not in assigned_ids or len(assigned_ids) != 1:
+            supabase.table("factory_users").delete().eq("factory_id", factory_id).execute()
+            supabase.table("factory_users").insert({"factory_id": factory_id, "user_id": customer_user_id}).execute()
+        return {"status": "success", "message": "Factory details and customer assignment updated"}
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"Update factory error: {error}")
+        raise HTTPException(status_code=503, detail="Unable to update factory or customer assignment")
+
+
+@app.put("/api/v1/admin/meters/{factory_id}/{slave_id}")
+def update_admin_meter(
+    factory_id: str,
+    slave_id: int,
+    request: UpdateMeterRequest,
+    claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    old_factory_id = validate_uuid(factory_id, "factory ID")
+    new_factory_id = validate_uuid(request.factory_id.strip(), "factory ID")
+    if not 1 <= slave_id <= 247:
+        raise HTTPException(status_code=400, detail="Invalid current slave ID")
+    new_slave_id = request.slave_id
+    meter_name = request.meter_name.strip()
+    if not meter_name:
+        raise HTTPException(status_code=400, detail="Meter name is required")
+    try:
+        existing = (supabase.table("factory_meters").select("factory_id, slave_id, meter_name")
+                    .eq("factory_id", old_factory_id).eq("slave_id", slave_id).execute()).data
+        if not existing:
+            raise HTTPException(status_code=404, detail="Meter registration not found")
+        target_factory = (supabase.table("factories").select("id")
+                          .eq("id", new_factory_id).maybe_single().execute()).data
+        if not target_factory:
+            raise HTTPException(status_code=404, detail="Target factory not found")
+        same_key = old_factory_id == new_factory_id and slave_id == new_slave_id
+        if not same_key:
+            duplicate = (supabase.table("factory_meters").select("factory_id, slave_id")
+                         .eq("factory_id", new_factory_id).eq("slave_id", new_slave_id).execute()).data
+            if duplicate:
+                raise HTTPException(status_code=409, detail="That slave ID is already registered in the selected factory")
+            # Insert new registration first; only remove the old one after insert succeeds.
+            supabase.table("factory_meters").insert({"factory_id": new_factory_id, "slave_id": new_slave_id, "meter_name": meter_name}).execute()
+            supabase.table("factory_meters").delete().eq("factory_id", old_factory_id).eq("slave_id", slave_id).execute()
+            with storage_lock:
+                old_reading = latest_meters.pop((old_factory_id, slave_id), None)
+                if old_reading is not None:
+                    old_reading["factory_id"] = new_factory_id
+                    old_reading["slave_id"] = new_slave_id
+                    old_reading["meter_name"] = meter_name
+                    latest_meters[(new_factory_id, new_slave_id)] = old_reading
+        else:
+            supabase.table("factory_meters").update({"meter_name": meter_name}).eq("factory_id", old_factory_id).eq("slave_id", slave_id).execute()
+            with storage_lock:
+                reading = latest_meters.get((old_factory_id, slave_id))
+                if reading is not None:
+                    reading["meter_name"] = meter_name
+        return {"status": "success", "message": "Meter registration updated"}
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"Update meter error: {error}")
+        raise HTTPException(status_code=503, detail="Unable to update meter registration")
+
+
+# --------------------------------------------------
+# ADMIN: DELETE CUSTOMER / FACTORY / METER
+# --------------------------------------------------
+# Safety policy: do not cascade-delete factories or meters unexpectedly.
+# Delete child records explicitly before deleting their parent.
+@app.delete("/api/v1/admin/meters/{factory_id}/{slave_id}")
+def delete_admin_meter(
+    factory_id: str,
+    slave_id: int,
+    claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    factory_id = validate_uuid(factory_id, "factory ID")
+    if not 1 <= slave_id <= 247:
+        raise HTTPException(status_code=400, detail="Invalid slave ID")
+    try:
+        existing = (supabase.table("factory_meters").select("slave_id")
+                    .eq("factory_id", factory_id).eq("slave_id", slave_id).execute())
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Meter not found")
+        supabase.table("factory_meters").delete().eq("factory_id", factory_id).eq("slave_id", slave_id).execute()
+        with storage_lock:
+            latest_meters.pop((factory_id, slave_id), None)
+        return {"status": "success", "message": "Meter deleted"}
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"Delete meter error: {error}")
+        raise HTTPException(status_code=503, detail="Unable to delete meter")
+
+
+@app.delete("/api/v1/admin/factories/{factory_id}")
+def delete_admin_factory(
+    factory_id: str,
+    claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    factory_id = validate_uuid(factory_id, "factory ID")
+    try:
+        existing = (supabase.table("factories").select("id")
+                    .eq("id", factory_id).execute())
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Factory not found")
+        meters = (supabase.table("factory_meters").select("slave_id")
+                  .eq("factory_id", factory_id).limit(1).execute())
+        if meters.data:
+            raise HTTPException(status_code=409, detail="Delete this factory's meters first")
+        # Remove access assignments before deleting the factory.
+        supabase.table("factory_users").delete().eq("factory_id", factory_id).execute()
+        supabase.table("factories").delete().eq("id", factory_id).execute()
+        with storage_lock:
+            for key in list(latest_meters):
+                if key[0] == factory_id:
+                    latest_meters.pop(key, None)
+        return {"status": "success", "message": "Factory deleted"}
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"Delete factory error: {error}")
+        raise HTTPException(status_code=503, detail="Unable to delete factory; verify dependent records")
+
+
+@app.delete("/api/v1/admin/customers/{customer_id}")
+def delete_admin_customer(
+    customer_id: str,
+    claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    customer_id = validate_uuid(customer_id, "customer ID")
+    try:
+        profile = (supabase.table("profiles").select("id, role")
+                   .eq("id", customer_id).maybe_single().execute()).data
+        if not profile or profile.get("role") != "customer":
+            raise HTTPException(status_code=404, detail="Customer not found")
+        assigned = (supabase.table("factory_users").select("factory_id")
+                    .eq("user_id", customer_id).limit(1).execute())
+        if assigned.data:
+            raise HTTPException(status_code=409, detail="Delete or reassign this customer's factories first")
+        # Auth deletion removes login access. Depending on database FK settings,
+        # profile may cascade-delete or need separate cleanup.
+        supabase.auth.admin.delete_user(customer_id)
+        supabase.table("profiles").delete().eq("id", customer_id).eq("role", "customer").execute()
+        return {"status": "success", "message": "Customer account deleted"}
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"Delete customer error: {error}")
+        raise HTTPException(status_code=503, detail="Unable to delete customer; inspect Supabase Auth and profile constraints")
+
+
 # --------------------------------------------------
 # RECEIVE NODE-RED TELEMETRY
 # --------------------------------------------------
@@ -808,269 +1029,30 @@ def get_telemetry(
             "meters": [],
         }
 
-    # Fetch registered meter names from Supabase. Do not rely on the
-    # telemetry payload to contain the customer-facing meter name.
-    try:
-        registered_result = (
-            supabase.table("factory_meters")
-            .select("factory_id, slave_id, meter_name")
-            .in_("factory_id", factory_ids)
-            .order("slave_id")
-            .execute()
-        )
-        registered_meters = registered_result.data or []
-
-        factory_result = (
-            supabase.table("factories")
-            .select("id, name, location")
-            .in_("id", factory_ids)
-            .execute()
-        )
-        factory_by_id = {
-            str(factory["id"]): factory
-            for factory in (factory_result.data or [])
-        }
-    except Exception as error:
-        print(f"Customer meter metadata error: {error}")
-        raise HTTPException(
-            status_code=503,
-            detail="Unable to retrieve registered meter names",
-        )
+    factory_meter_map = get_factory_meter_map(factory_ids)
 
     with storage_lock:
-        stored_readings = dict(latest_meters)
+        stored_readings = list(latest_meters.values())
 
-    now = datetime.now(timezone.utc)
-    online_cutoff = now - timedelta(seconds=120)
-    output: list[dict[str, Any]] = []
+    # Match on BOTH factory_id and slave_id. Never filter by slave ID alone.
+    filtered_meters = [
+        reading
+        for reading in stored_readings
+        if reading.get("factory_id") in factory_ids
+        and int(reading.get("slave_id", 0)) in factory_meter_map.get(
+            str(reading.get("factory_id")), set()
+        )
+    ]
 
-    # Return every meter registered to the customer's assigned factories,
-    # including meters that have not sent telemetry yet.
-    for registered in registered_meters:
-        factory_id = str(registered["factory_id"])
-        slave_id = int(registered["slave_id"])
-        reading = stored_readings.get((factory_id, slave_id), {})
-        factory = factory_by_id.get(factory_id, {})
-        last_seen = reading.get("last_seen")
-
-        try:
-            seen_at = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
-            is_online = seen_at >= online_cutoff
-        except (TypeError, ValueError):
-            is_online = False
-
-        item: dict[str, Any] = {
-            "factory_id": factory_id,
-            "factory_name": factory.get("name") or "Unknown factory",
-            "factory_location": factory.get("location") or "",
-            "site": factory.get("name") or "Unknown factory",
-            "slave_id": slave_id,
-            "meter_name": registered.get("meter_name") or f"Meter {slave_id}",
-            "status": "online" if is_online else "offline",
-            "online": is_online,
-            "last_seen": last_seen,
-            "data_source": reading.get("data_source"),
-        }
-
-        # Add the latest reading values without allowing telemetry to
-        # override registered identity or factory assignment.
-        for key, value in reading.items():
-            if key not in {
-                "factory_id", "slave_id", "meter_name",
-                "last_seen", "data_source", "status", "online",
-            }:
-                item[key] = value
-
-        output.append(item)
-
-    data_source = next(
-        (meter.get("data_source") for meter in output if meter.get("data_source")),
-        "SIMULATED",
+    data_source = (
+        filtered_meters[0].get("data_source", "NODE_RED")
+        if filtered_meters
+        else "SIMULATED"
     )
 
     return {
         "data_source": data_source,
-        "count": len(output),
+        "count": len(filtered_meters),
         "factories": factory_ids,
-        "meters": output,
-    }
-
-# --------------------------------------------------
-# CUSTOMER: HISTORICAL ENERGY ANALYTICS (InfluxDB 2.x)
-# --------------------------------------------------
-def _influx_client() -> InfluxDBClient:
-    if not INFLUXDB_TOKEN:
-        raise HTTPException(
-            status_code=503,
-            detail="Energy analytics is not configured. Set INFLUXDB_TOKEN in Render.",
-        )
-    return InfluxDBClient(
-        url=INFLUXDB_URL,
-        token=INFLUXDB_TOKEN,
-        org=INFLUXDB_ORG,
-        timeout=15000,
-    )
-
-
-@app.get("/api/v1/analytics/energy")
-def get_energy_analytics(
-    days: int = 30,
-    claims: dict[str, Any] = Depends(require_customer),
-) -> dict[str, Any]:
-    """Return daily cumulative-energy deltas for the signed-in customer's meters."""
-    if days < 1 or days > 90:
-        raise HTTPException(status_code=400, detail="days must be between 1 and 90")
-
-    user_id = claims.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID missing from login token")
-
-    factory_ids = get_assigned_factories(user_id)
-    if not factory_ids:
-        return {
-            "timezone": ANALYTICS_TIMEZONE, "unit": "kWh", "days": days,
-            "totals": {"today_kwh": 0, "yesterday_kwh": 0, "month_kwh": 0},
-            "daily": [], "meters": [], "note": "No factories are assigned to this customer.",
-        }
-
-    try:
-        registered_result = (
-            supabase.table("factory_meters")
-            .select("factory_id, slave_id, meter_name")
-            .in_("factory_id", factory_ids)
-            .order("slave_id")
-            .execute()
-        )
-        registered_meters = registered_result.data or []
-    except Exception as error:
-        print(f"Analytics meter lookup error: {error}")
-        raise HTTPException(status_code=503, detail="Unable to retrieve registered meters")
-
-    if not registered_meters:
-        return {
-            "timezone": ANALYTICS_TIMEZONE, "unit": "kWh", "days": days,
-            "totals": {"today_kwh": 0, "yesterday_kwh": 0, "month_kwh": 0},
-            "daily": [], "meters": [], "note": "No meters are registered to assigned factories.",
-        }
-
-    # The current Influx schema has slave_id as a tag but does not show factory_id.
-    # If IDs repeat across factories, add factory_id as an Influx tag to avoid mixing.
-    slave_ids = sorted({int(row["slave_id"]) for row in registered_meters})
-    slave_filter = " or ".join([f'r["slave_id"] == "{sid}"' for sid in slave_ids])
-    query = f'''
-from(bucket: "{INFLUXDB_BUCKET}")
-  |> range(start: -{days + 2}d)
-  |> filter(fn: (r) => r["_measurement"] == "pm800_telemetry")
-  |> filter(fn: (r) => r["_field"] == "energy_combined")
-  |> filter(fn: (r) => r["device"] == "PM800")
-  |> filter(fn: (r) => {slave_filter})
-  |> keep(columns: ["_time", "_value", "slave_id"])
-  |> sort(columns: ["_time"])
-'''
-    try:
-        with _influx_client() as client:
-            tables = client.query_api().query(query=query, org=INFLUXDB_ORG)
-        points: dict[int, list[tuple[datetime, float]]] = {}
-        for table in tables:
-            for record in table.records:
-                try:
-                    sid = int(record.values.get("slave_id"))
-                    timestamp = record.get_time()
-                    value = float(record.get_value())
-                    if timestamp is not None and value == value:
-                        points.setdefault(sid, []).append((timestamp, value))
-                except (TypeError, ValueError):
-                    continue
-    except Exception as error:
-        print(f"InfluxDB energy analytics query error: {error}")
-        raise HTTPException(
-            status_code=503,
-            detail="Unable to query InfluxDB. Check URL, organization, bucket, token, and schema.",
-        )
-
-    try:
-        local_tz = ZoneInfo(ANALYTICS_TIMEZONE)
-    except Exception:
-        local_tz = ZoneInfo("Asia/Kolkata")
-
-    now_local = datetime.now(local_tz)
-    start_date = now_local.date() - timedelta(days=days - 1)
-    yesterday_date = now_local.date() - timedelta(days=1)
-    month_start = now_local.date().replace(day=1)
-
-    meter_rows = []
-    daily_totals: dict[str, float] = {}
-    today_total = yesterday_total = month_total = 0.0
-
-    for registered in registered_meters:
-        sid = int(registered["slave_id"])
-        rows = sorted(points.get(sid, []), key=lambda pair: pair[0])
-        local_rows: list[tuple[datetime, float]] = []
-        for timestamp, value in rows:
-            if timestamp.tzinfo is None:
-                timestamp = timestamp.replace(tzinfo=timezone.utc)
-            local_rows.append((timestamp.astimezone(local_tz), value))
-
-        per_day: dict[str, float] = {}
-        for offset in range(days):
-            day = start_date + timedelta(days=offset)
-            next_day = day + timedelta(days=1)
-            baseline_values = [v for t, v in local_rows if t.date() < day]
-            day_values = [(t, v) for t, v in local_rows if day <= t.date() < next_day]
-            if not day_values:
-                continue
-            # If no prior-day baseline exists, the first sample is only a baseline;
-            # do not falsely report it as consumption.
-            if not baseline_values:
-                continue
-            baseline = baseline_values[-1]
-            latest = day_values[-1][1]
-            delta = latest - baseline
-            if delta < 0:  # meter reset or rollover; don't show negative consumption
-                delta = 0.0
-            per_day[day.isoformat()] = round(delta, 3)
-            daily_totals[day.isoformat()] = daily_totals.get(day.isoformat(), 0.0) + delta
-
-        today_kwh = per_day.get(now_local.date().isoformat(), 0.0)
-        yesterday_kwh = per_day.get(yesterday_date.isoformat(), 0.0)
-        meter_month_kwh = sum(
-            value for date_key, value in per_day.items()
-            if date.fromisoformat(date_key) >= month_start
-        )
-        today_total += today_kwh
-        yesterday_total += yesterday_kwh
-        month_total += meter_month_kwh
-        meter_rows.append({
-            "factory_id": str(registered["factory_id"]),
-            "slave_id": sid,
-            "meter_name": registered.get("meter_name") or f"Meter {sid}",
-            "today_kwh": round(today_kwh, 3),
-            "yesterday_kwh": round(yesterday_kwh, 3),
-            "month_kwh": round(meter_month_kwh, 3),
-            "samples": len(rows),
-            "has_data": bool(rows),
-        })
-
-    daily = [
-        {"date": (start_date + timedelta(days=offset)).isoformat(),
-         "kwh": round(daily_totals.get((start_date + timedelta(days=offset)).isoformat(), 0.0), 3)}
-        for offset in range(days)
-    ]
-
-    return {
-        "timezone": ANALYTICS_TIMEZONE,
-        "bucket": INFLUXDB_BUCKET,
-        "measurement": "pm800_telemetry",
-        "energy_field": "energy_combined",
-        "unit": "kWh",
-        "days": days,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "totals": {
-            "today_kwh": round(today_total, 3),
-            "yesterday_kwh": round(yesterday_total, 3),
-            "month_kwh": round(month_total, 3),
-        },
-        "daily": daily,
-        "meters": meter_rows,
-        "note": "Assumes energy_combined is cumulative kWh. Verify scaling. Add factory_id as an InfluxDB tag if slave IDs repeat across factories.",
+        "meters": filtered_meters,
     }
