@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 PyJWT[crypto]
 supabase
+influxdb-client
