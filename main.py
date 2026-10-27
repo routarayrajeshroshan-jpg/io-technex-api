@@ -5,6 +5,7 @@ from threading import Lock
 from functools import lru_cache
 from typing import Any
 from uuid import UUID
+import math
 
 import jwt
 from jwt import PyJWKClient
@@ -24,6 +25,16 @@ SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"]
 NODE_RED_API_KEY = os.environ["NODE_RED_API_KEY"]
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+
+
+# --------------------------------------------------
+# ALARM CONFIGURATION
+# These are safe starting examples; tune per meter/site in Render env vars.
+# --------------------------------------------------
+HIGH_CURRENT_LIMIT_A = float(os.getenv("HIGH_CURRENT_LIMIT_A", "100"))
+LOW_VOLTAGE_LIMIT_V = float(os.getenv("LOW_VOLTAGE_LIMIT_V", "200"))
+HIGH_VOLTAGE_LIMIT_V = float(os.getenv("HIGH_VOLTAGE_LIMIT_V", "250"))
+METER_OFFLINE_SECONDS = int(os.getenv("METER_OFFLINE_SECONDS", "120"))
 
 
 # --------------------------------------------------
@@ -231,6 +242,145 @@ class TelemetryPayload(BaseModel):
     factory_id: str = Field(min_length=1, max_length=100)
     data_source: str = Field(default="NODE_RED", min_length=1, max_length=40)
     meters: list[MeterReading] = Field(min_length=1, max_length=500)
+
+
+
+# --------------------------------------------------
+# ALARM ENGINE HELPERS
+# --------------------------------------------------
+def _numeric_reading(reading: dict[str, Any], *keys: str) -> float | None:
+    """Read a numeric telemetry field, accepting common key spellings."""
+    for key in keys:
+        value = reading.get(key)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+            if math.isfinite(number):
+                return number
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _set_alarm_condition(
+    factory_id: str,
+    slave_id: int,
+    meter_name: str,
+    alarm_type: str,
+    message: str,
+    measured_value: float | None,
+    threshold_value: float | None,
+    triggered: bool,
+) -> None:
+    """
+    Maintain one open alarm per factory/meter/type.
+    Active or acknowledged alarms are not duplicated; normal readings resolve them.
+    """
+    query = (
+        supabase.table("alarms")
+        .select("id, status")
+        .eq("factory_id", factory_id)
+        .eq("slave_id", slave_id)
+        .eq("alarm_type", alarm_type)
+        .in_("status", ["active", "acknowledged"])
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    existing = (query.data or [None])[0]
+
+    if triggered and existing is None:
+        supabase.table("alarms").insert({
+            "factory_id": factory_id,
+            "slave_id": slave_id,
+            "meter_name": meter_name,
+            "alarm_type": alarm_type,
+            "message": message,
+            "measured_value": measured_value,
+            "threshold_value": threshold_value,
+            "status": "active",
+        }).execute()
+    elif triggered and existing is not None:
+        # Refresh the latest value/message without creating duplicate rows.
+        supabase.table("alarms").update({
+            "meter_name": meter_name,
+            "message": message,
+            "measured_value": measured_value,
+            "threshold_value": threshold_value,
+        }).eq("id", existing["id"]).execute()
+    elif not triggered and existing is not None:
+        supabase.table("alarms").update({
+            "status": "resolved",
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+            "measured_value": measured_value,
+        }).eq("id", existing["id"]).execute()
+
+
+def evaluate_reading_alarms(factory_id: str, reading: dict[str, Any]) -> None:
+    """Evaluate current and voltage alarms for a validated registered meter."""
+    slave_id = int(reading["slave_id"])
+    meter_name = str(reading.get("meter_name") or f"Meter {slave_id}")
+
+    current = _numeric_reading(reading, "current", "current_a", "current_A", "amps", "Current")
+    if current is not None:
+        _set_alarm_condition(
+            factory_id, slave_id, meter_name, "HIGH_CURRENT",
+            f"{meter_name}: current {current:g} A exceeds limit {HIGH_CURRENT_LIMIT_A:g} A",
+            current, HIGH_CURRENT_LIMIT_A, current > HIGH_CURRENT_LIMIT_A,
+        )
+
+    voltage = _numeric_reading(reading, "voltage", "voltage_v", "voltage_V", "Voltage")
+    if voltage is not None:
+        _set_alarm_condition(
+            factory_id, slave_id, meter_name, "LOW_VOLTAGE",
+            f"{meter_name}: voltage {voltage:g} V is below limit {LOW_VOLTAGE_LIMIT_V:g} V",
+            voltage, LOW_VOLTAGE_LIMIT_V, voltage < LOW_VOLTAGE_LIMIT_V,
+        )
+        _set_alarm_condition(
+            factory_id, slave_id, meter_name, "HIGH_VOLTAGE",
+            f"{meter_name}: voltage {voltage:g} V exceeds limit {HIGH_VOLTAGE_LIMIT_V:g} V",
+            voltage, HIGH_VOLTAGE_LIMIT_V, voltage > HIGH_VOLTAGE_LIMIT_V,
+        )
+
+
+def refresh_offline_alarms(factory_ids: list[str]) -> None:
+    """
+    Reconcile offline alarms for the supplied factories.
+    This runs when an authorized alarm-list request is made; it is not a background
+    scheduler, so a future periodic worker is needed for time-triggered alerts/emails.
+    """
+    if not factory_ids:
+        return
+    registered_result = (
+        supabase.table("factory_meters")
+        .select("factory_id, slave_id, meter_name")
+        .in_("factory_id", factory_ids)
+        .execute()
+    )
+    registered = registered_result.data or []
+    with storage_lock:
+        readings = dict(latest_meters)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=METER_OFFLINE_SECONDS)
+    for meter in registered:
+        factory_id = str(meter["factory_id"])
+        slave_id = int(meter["slave_id"])
+        meter_name = str(meter.get("meter_name") or f"Meter {slave_id}")
+        reading = readings.get((factory_id, slave_id), {})
+        last_seen = reading.get("last_seen")
+        try:
+            seen_at = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+            offline = seen_at < cutoff
+        except (TypeError, ValueError):
+            offline = True
+
+        _set_alarm_condition(
+            factory_id, slave_id, meter_name, "METER_OFFLINE",
+            (f"{meter_name}: no telemetry received for at least "
+             f"{METER_OFFLINE_SECONDS} seconds"),
+            None, float(METER_OFFLINE_SECONDS), offline,
+        )
 
 
 # --------------------------------------------------
@@ -956,12 +1106,15 @@ def receive_telemetry(
 
         registered_result = (
             supabase.table("factory_meters")
-            .select("slave_id")
+            .select("slave_id, meter_name")
             .eq("factory_id", factory_id)
             .execute()
         )
-        registered_ids = {
-            int(row["slave_id"]) for row in (registered_result.data or [])
+        registered_rows = registered_result.data or []
+        registered_ids = {int(row["slave_id"]) for row in registered_rows}
+        meter_names = {
+            int(row["slave_id"]): str(row.get("meter_name") or f"Meter {row['slave_id']}")
+            for row in registered_rows
         }
     except HTTPException:
         raise
@@ -991,6 +1144,7 @@ def receive_telemetry(
 
         seen_ids.add(slave_id)
         reading["factory_id"] = factory_id
+        reading["meter_name"] = meter_names.get(slave_id, f"Meter {slave_id}")
         reading["data_source"] = payload.data_source
         reading["last_seen"] = datetime.now(timezone.utc).isoformat()
         normalized_readings.append(reading)
@@ -999,6 +1153,15 @@ def receive_telemetry(
         for reading in normalized_readings:
             key = (factory_id, int(reading["slave_id"]))
             latest_meters[key] = reading
+
+    # Alarm database failures must be visible to logs, but must not silently
+    # invalidate telemetry that has already been accepted into memory.
+    for reading in normalized_readings:
+        try:
+            evaluate_reading_alarms(factory_id, reading)
+        except Exception as error:
+            print(f"Alarm evaluation failed for factory={factory_id}, "
+                  f"slave_id={reading.get('slave_id')}: {error}")
 
     return {
         "status": "success",
@@ -1056,3 +1219,107 @@ def get_telemetry(
         "factories": factory_ids,
         "meters": filtered_meters,
     }
+
+# --------------------------------------------------
+# ALARMS: ADMIN LIST / CUSTOMER LIST / ACKNOWLEDGE
+# --------------------------------------------------
+@app.get("/api/v1/admin/alarms")
+def list_admin_alarms(
+    status: str | None = None,
+    factory_id: str | None = None,
+    claims: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """List alarm records for admins; reconcile meter-offline state first."""
+    try:
+        if factory_id:
+            factory_id = validate_uuid(factory_id, "factory ID")
+            factory_ids = [factory_id]
+        else:
+            result = supabase.table("factories").select("id").execute()
+            factory_ids = [str(row["id"]) for row in (result.data or [])]
+        refresh_offline_alarms(factory_ids)
+        query = supabase.table("alarms").select("*").in_("factory_id", factory_ids)
+        if status:
+            if status not in {"active", "acknowledged", "resolved"}:
+                raise HTTPException(status_code=400, detail="Invalid alarm status")
+            query = query.eq("status", status)
+        result = query.order("created_at", desc=True).limit(500).execute()
+        return {"alarms": result.data or [], "count": len(result.data or [])}
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"List admin alarms error: {error}")
+        raise HTTPException(status_code=503, detail="Unable to retrieve alarms")
+
+
+@app.get("/api/v1/alarms")
+def list_customer_alarms(
+    status: str | None = None,
+    claims: dict[str, Any] = Depends(require_customer),
+) -> dict[str, Any]:
+    """Return alarms only for factories assigned to the logged-in customer."""
+    user_id = claims.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID missing from login token")
+    factory_ids = get_assigned_factories(str(user_id))
+    try:
+        refresh_offline_alarms(factory_ids)
+        if not factory_ids:
+            return {"alarms": [], "count": 0}
+        query = supabase.table("alarms").select("*").in_("factory_id", factory_ids)
+        if status:
+            if status not in {"active", "acknowledged", "resolved"}:
+                raise HTTPException(status_code=400, detail="Invalid alarm status")
+            query = query.eq("status", status)
+        result = query.order("created_at", desc=True).limit(500).execute()
+        return {"alarms": result.data or [], "count": len(result.data or [])}
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"List customer alarms error: {error}")
+        raise HTTPException(status_code=503, detail="Unable to retrieve alarms")
+
+
+@app.post("/api/v1/alarms/{alarm_id}/acknowledge")
+def acknowledge_alarm(
+    alarm_id: str,
+    claims: dict[str, Any] = Depends(require_customer),
+) -> dict[str, Any]:
+    """Allow admin or a customer assigned to the alarm's factory to acknowledge it."""
+    alarm_id = validate_uuid(alarm_id, "alarm ID")
+    user_id = str(claims.get("sub") or "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID missing from login token")
+    try:
+        alarm_result = (
+            supabase.table("alarms").select("id, factory_id, status")
+            .eq("id", alarm_id).maybe_single().execute()
+        )
+        alarm = alarm_result.data
+        if not alarm:
+            raise HTTPException(status_code=404, detail="Alarm not found")
+
+        profile_result = (
+            supabase.table("profiles").select("role")
+            .eq("id", user_id).maybe_single().execute()
+        )
+        profile = profile_result.data or {}
+        is_admin = profile.get("role") == "admin"
+        if not is_admin and str(alarm["factory_id"]) not in get_assigned_factories(user_id):
+            raise HTTPException(status_code=403, detail="You do not have access to this alarm")
+        if alarm["status"] == "resolved":
+            raise HTTPException(status_code=409, detail="Resolved alarms cannot be acknowledged")
+        updated = (
+            supabase.table("alarms").update({
+                "status": "acknowledged",
+                "acknowledged_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", alarm_id).execute()
+        )
+        return {"status": "success", "message": "Alarm acknowledged",
+                "alarm": (updated.data or [None])[0]}
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"Acknowledge alarm error: {error}")
+        raise HTTPException(status_code=503, detail="Unable to acknowledge alarm")
+
