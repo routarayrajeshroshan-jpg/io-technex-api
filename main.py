@@ -798,30 +798,89 @@ def get_telemetry(
             "meters": [],
         }
 
-    factory_meter_map = get_factory_meter_map(factory_ids)
+    # Fetch registered meter names from Supabase. Do not rely on the
+    # telemetry payload to contain the customer-facing meter name.
+    try:
+        registered_result = (
+            supabase.table("factory_meters")
+            .select("factory_id, slave_id, meter_name")
+            .in_("factory_id", factory_ids)
+            .order("slave_id")
+            .execute()
+        )
+        registered_meters = registered_result.data or []
+
+        factory_result = (
+            supabase.table("factories")
+            .select("id, name, location")
+            .in_("id", factory_ids)
+            .execute()
+        )
+        factory_by_id = {
+            str(factory["id"]): factory
+            for factory in (factory_result.data or [])
+        }
+    except Exception as error:
+        print(f"Customer meter metadata error: {error}")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to retrieve registered meter names",
+        )
 
     with storage_lock:
-        stored_readings = list(latest_meters.values())
+        stored_readings = dict(latest_meters)
 
-    # Match on BOTH factory_id and slave_id. Never filter by slave ID alone.
-    filtered_meters = [
-        reading
-        for reading in stored_readings
-        if reading.get("factory_id") in factory_ids
-        and int(reading.get("slave_id", 0)) in factory_meter_map.get(
-            str(reading.get("factory_id")), set()
-        )
-    ]
+    now = datetime.now(timezone.utc)
+    online_cutoff = now - timedelta(seconds=120)
+    output: list[dict[str, Any]] = []
 
-    data_source = (
-        filtered_meters[0].get("data_source", "NODE_RED")
-        if filtered_meters
-        else "SIMULATED"
+    # Return every meter registered to the customer's assigned factories,
+    # including meters that have not sent telemetry yet.
+    for registered in registered_meters:
+        factory_id = str(registered["factory_id"])
+        slave_id = int(registered["slave_id"])
+        reading = stored_readings.get((factory_id, slave_id), {})
+        factory = factory_by_id.get(factory_id, {})
+        last_seen = reading.get("last_seen")
+
+        try:
+            seen_at = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+            is_online = seen_at >= online_cutoff
+        except (TypeError, ValueError):
+            is_online = False
+
+        item: dict[str, Any] = {
+            "factory_id": factory_id,
+            "factory_name": factory.get("name") or "Unknown factory",
+            "factory_location": factory.get("location") or "",
+            "site": factory.get("name") or "Unknown factory",
+            "slave_id": slave_id,
+            "meter_name": registered.get("meter_name") or f"Meter {slave_id}",
+            "status": "online" if is_online else "offline",
+            "online": is_online,
+            "last_seen": last_seen,
+            "data_source": reading.get("data_source"),
+        }
+
+        # Add the latest reading values without allowing telemetry to
+        # override registered identity or factory assignment.
+        for key, value in reading.items():
+            if key not in {
+                "factory_id", "slave_id", "meter_name",
+                "last_seen", "data_source", "status", "online",
+            }:
+                item[key] = value
+
+        output.append(item)
+
+    data_source = next(
+        (meter.get("data_source") for meter in output if meter.get("data_source")),
+        "SIMULATED",
     )
 
     return {
         "data_source": data_source,
-        "count": len(filtered_meters),
+        "count": len(output),
         "factories": factory_ids,
-        "meters": filtered_meters,
+        "meters": output,
     }
