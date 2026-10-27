@@ -1,10 +1,13 @@
 import os
 import hmac
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from threading import Lock
 from functools import lru_cache
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
+
+from influxdb_client import InfluxDBClient
 
 import jwt
 from jwt import PyJWKClient
@@ -22,6 +25,13 @@ from pydantic import BaseModel, Field, ConfigDict
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"]
 NODE_RED_API_KEY = os.environ["NODE_RED_API_KEY"]
+
+# InfluxDB 2.x settings. Configure these in Render Environment.
+INFLUXDB_URL = os.getenv("INFLUXDB_URL", "https://us-east-1-1.aws.cloud2.influxdata.com").rstrip("/")
+INFLUXDB_ORG = os.getenv("INFLUXDB_ORG", "asianpaints")
+INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET", "asianpaints_utility_smartems")
+INFLUXDB_TOKEN = os.getenv("INFLUXDB_TOKEN", "")
+ANALYTICS_TIMEZONE = os.getenv("ANALYTICS_TIMEZONE", "Asia/Kolkata")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
@@ -883,4 +893,184 @@ def get_telemetry(
         "count": len(output),
         "factories": factory_ids,
         "meters": output,
+    }
+
+# --------------------------------------------------
+# CUSTOMER: HISTORICAL ENERGY ANALYTICS (InfluxDB 2.x)
+# --------------------------------------------------
+def _influx_client() -> InfluxDBClient:
+    if not INFLUXDB_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Energy analytics is not configured. Set INFLUXDB_TOKEN in Render.",
+        )
+    return InfluxDBClient(
+        url=INFLUXDB_URL,
+        token=INFLUXDB_TOKEN,
+        org=INFLUXDB_ORG,
+        timeout=15000,
+    )
+
+
+@app.get("/api/v1/analytics/energy")
+def get_energy_analytics(
+    days: int = 30,
+    claims: dict[str, Any] = Depends(require_customer),
+) -> dict[str, Any]:
+    """Return daily cumulative-energy deltas for the signed-in customer's meters."""
+    if days < 1 or days > 90:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 90")
+
+    user_id = claims.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID missing from login token")
+
+    factory_ids = get_assigned_factories(user_id)
+    if not factory_ids:
+        return {
+            "timezone": ANALYTICS_TIMEZONE, "unit": "kWh", "days": days,
+            "totals": {"today_kwh": 0, "yesterday_kwh": 0, "month_kwh": 0},
+            "daily": [], "meters": [], "note": "No factories are assigned to this customer.",
+        }
+
+    try:
+        registered_result = (
+            supabase.table("factory_meters")
+            .select("factory_id, slave_id, meter_name")
+            .in_("factory_id", factory_ids)
+            .order("slave_id")
+            .execute()
+        )
+        registered_meters = registered_result.data or []
+    except Exception as error:
+        print(f"Analytics meter lookup error: {error}")
+        raise HTTPException(status_code=503, detail="Unable to retrieve registered meters")
+
+    if not registered_meters:
+        return {
+            "timezone": ANALYTICS_TIMEZONE, "unit": "kWh", "days": days,
+            "totals": {"today_kwh": 0, "yesterday_kwh": 0, "month_kwh": 0},
+            "daily": [], "meters": [], "note": "No meters are registered to assigned factories.",
+        }
+
+    # The current Influx schema has slave_id as a tag but does not show factory_id.
+    # If IDs repeat across factories, add factory_id as an Influx tag to avoid mixing.
+    slave_ids = sorted({int(row["slave_id"]) for row in registered_meters})
+    slave_filter = " or ".join([f'r["slave_id"] == "{sid}"' for sid in slave_ids])
+    query = f'''
+from(bucket: "{INFLUXDB_BUCKET}")
+  |> range(start: -{days + 2}d)
+  |> filter(fn: (r) => r["_measurement"] == "pm800_telemetry")
+  |> filter(fn: (r) => r["_field"] == "energy_combined")
+  |> filter(fn: (r) => r["device"] == "PM800")
+  |> filter(fn: (r) => {slave_filter})
+  |> keep(columns: ["_time", "_value", "slave_id"])
+  |> sort(columns: ["_time"])
+'''
+    try:
+        with _influx_client() as client:
+            tables = client.query_api().query(query=query, org=INFLUXDB_ORG)
+        points: dict[int, list[tuple[datetime, float]]] = {}
+        for table in tables:
+            for record in table.records:
+                try:
+                    sid = int(record.values.get("slave_id"))
+                    timestamp = record.get_time()
+                    value = float(record.get_value())
+                    if timestamp is not None and value == value:
+                        points.setdefault(sid, []).append((timestamp, value))
+                except (TypeError, ValueError):
+                    continue
+    except Exception as error:
+        print(f"InfluxDB energy analytics query error: {error}")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to query InfluxDB. Check URL, organization, bucket, token, and schema.",
+        )
+
+    try:
+        local_tz = ZoneInfo(ANALYTICS_TIMEZONE)
+    except Exception:
+        local_tz = ZoneInfo("Asia/Kolkata")
+
+    now_local = datetime.now(local_tz)
+    start_date = now_local.date() - timedelta(days=days - 1)
+    yesterday_date = now_local.date() - timedelta(days=1)
+    month_start = now_local.date().replace(day=1)
+
+    meter_rows = []
+    daily_totals: dict[str, float] = {}
+    today_total = yesterday_total = month_total = 0.0
+
+    for registered in registered_meters:
+        sid = int(registered["slave_id"])
+        rows = sorted(points.get(sid, []), key=lambda pair: pair[0])
+        local_rows: list[tuple[datetime, float]] = []
+        for timestamp, value in rows:
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            local_rows.append((timestamp.astimezone(local_tz), value))
+
+        per_day: dict[str, float] = {}
+        for offset in range(days):
+            day = start_date + timedelta(days=offset)
+            next_day = day + timedelta(days=1)
+            baseline_values = [v for t, v in local_rows if t.date() < day]
+            day_values = [(t, v) for t, v in local_rows if day <= t.date() < next_day]
+            if not day_values:
+                continue
+            # If no prior-day baseline exists, the first sample is only a baseline;
+            # do not falsely report it as consumption.
+            if not baseline_values:
+                continue
+            baseline = baseline_values[-1]
+            latest = day_values[-1][1]
+            delta = latest - baseline
+            if delta < 0:  # meter reset or rollover; don't show negative consumption
+                delta = 0.0
+            per_day[day.isoformat()] = round(delta, 3)
+            daily_totals[day.isoformat()] = daily_totals.get(day.isoformat(), 0.0) + delta
+
+        today_kwh = per_day.get(now_local.date().isoformat(), 0.0)
+        yesterday_kwh = per_day.get(yesterday_date.isoformat(), 0.0)
+        meter_month_kwh = sum(
+            value for date_key, value in per_day.items()
+            if date.fromisoformat(date_key) >= month_start
+        )
+        today_total += today_kwh
+        yesterday_total += yesterday_kwh
+        month_total += meter_month_kwh
+        meter_rows.append({
+            "factory_id": str(registered["factory_id"]),
+            "slave_id": sid,
+            "meter_name": registered.get("meter_name") or f"Meter {sid}",
+            "today_kwh": round(today_kwh, 3),
+            "yesterday_kwh": round(yesterday_kwh, 3),
+            "month_kwh": round(meter_month_kwh, 3),
+            "samples": len(rows),
+            "has_data": bool(rows),
+        })
+
+    daily = [
+        {"date": (start_date + timedelta(days=offset)).isoformat(),
+         "kwh": round(daily_totals.get((start_date + timedelta(days=offset)).isoformat(), 0.0), 3)}
+        for offset in range(days)
+    ]
+
+    return {
+        "timezone": ANALYTICS_TIMEZONE,
+        "bucket": INFLUXDB_BUCKET,
+        "measurement": "pm800_telemetry",
+        "energy_field": "energy_combined",
+        "unit": "kWh",
+        "days": days,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "totals": {
+            "today_kwh": round(today_total, 3),
+            "yesterday_kwh": round(yesterday_total, 3),
+            "month_kwh": round(month_total, 3),
+        },
+        "daily": daily,
+        "meters": meter_rows,
+        "note": "Assumes energy_combined is cumulative kWh. Verify scaling. Add factory_id as an InfluxDB tag if slave IDs repeat across factories.",
     }
