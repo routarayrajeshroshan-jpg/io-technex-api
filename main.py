@@ -1223,6 +1223,112 @@ def receive_telemetry(
     }
 
 
+
+
+# --------------------------------------------------
+# CUSTOMER: FACTORIES AND REGISTERED METERS (INCLUDING OFFLINE METERS)
+# --------------------------------------------------
+@app.get("/api/v1/customer/factories")
+def get_customer_factories(
+    claims: dict[str, Any] = Depends(require_customer),
+) -> dict[str, Any]:
+    """
+    Return all factories assigned to the logged-in customer, including factories
+    and registered meters that have never sent telemetry or are currently offline.
+    """
+    user_id = str(claims.get("sub") or "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID missing from login token")
+
+    factory_ids = get_assigned_factories(user_id)
+    if not factory_ids:
+        return {"factories": [], "count": 0, "meter_count": 0}
+
+    try:
+        factories_result = (
+            supabase.table("factories")
+            .select("id, name, location, created_at")
+            .in_("id", factory_ids)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        factory_rows = factories_result.data or []
+
+        meters_result = (
+            supabase.table("factory_meters")
+            .select("factory_id, slave_id, meter_name")
+            .in_("factory_id", factory_ids)
+            .order("slave_id")
+            .execute()
+        )
+        registered_meters = meters_result.data or []
+
+        with storage_lock:
+            readings_by_key = dict(latest_meters)
+
+        now = datetime.now(timezone.utc)
+        online_cutoff = now - timedelta(seconds=120)
+        meters_by_factory: dict[str, list[dict[str, Any]]] = {
+            str(factory_id): [] for factory_id in factory_ids
+        }
+
+        for registered in registered_meters:
+            factory_id = str(registered["factory_id"])
+            slave_id = int(registered["slave_id"])
+            reading = readings_by_key.get((factory_id, slave_id), {})
+            last_seen = reading.get("last_seen")
+            try:
+                seen_at = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+                is_online = seen_at >= online_cutoff
+            except (TypeError, ValueError):
+                is_online = False
+
+            meter = {
+                "factory_id": factory_id,
+                "slave_id": slave_id,
+                "meter_name": registered.get("meter_name") or f"Meter {slave_id}",
+                "status": "online" if is_online else "offline",
+                "online": is_online,
+                "last_seen": last_seen,
+            }
+            for key, value in reading.items():
+                if key not in {"factory_id", "slave_id", "meter_name", "last_seen", "data_source"}:
+                    meter[key] = value
+            meters_by_factory.setdefault(factory_id, []).append(meter)
+
+        output = []
+        for factory in factory_rows:
+            factory_id = str(factory["id"])
+            factory_meters = meters_by_factory.get(factory_id, [])
+            output.append({
+                "id": factory_id,
+                "name": factory.get("name") or "Unnamed factory",
+                "location": factory.get("location") or "",
+                "created_at": factory.get("created_at"),
+                "meters": factory_meters,
+                "meter_count": len(factory_meters),
+                "online_meters": sum(1 for meter in factory_meters if meter["online"]),
+                "offline_meters": sum(1 for meter in factory_meters if not meter["online"]),
+                "energy_total": sum(
+                    float(meter.get("energy", meter.get("energy_kwh", 0)) or 0)
+                    for meter in factory_meters
+                    if _numeric_reading(meter, "energy", "energy_kwh", "kwh", "active_energy") is not None
+                ),
+            })
+
+        return {
+            "factories": output,
+            "count": len(output),
+            "meter_count": sum(factory["meter_count"] for factory in output),
+        }
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"Customer factories error: {type(error).__name__}: {error}")
+        traceback.print_exc()
+        raise HTTPException(status_code=503, detail="Unable to retrieve assigned factories and registered meters")
+
+
 # --------------------------------------------------
 # CUSTOMER: RETURN ONLY ASSIGNED FACTORY METERS
 # --------------------------------------------------
