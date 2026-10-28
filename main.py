@@ -1145,14 +1145,17 @@ def receive_telemetry(
 
     # Only accept telemetry for a factory and meters already registered in Supabase.
     try:
+        # Use list responses instead of maybe_single() for more predictable
+        # behavior across Supabase/PostgREST client versions.
         factory_result = (
             supabase.table("factories")
             .select("id")
             .eq("id", factory_id)
-            .maybe_single()
+            .limit(1)
             .execute()
         )
-        if not factory_result.data:
+        factory_rows = getattr(factory_result, "data", None) if factory_result is not None else None
+        if not factory_rows:
             raise HTTPException(status_code=404, detail="Factory not found")
 
         registered_result = (
@@ -1161,7 +1164,9 @@ def receive_telemetry(
             .eq("factory_id", factory_id)
             .execute()
         )
-        registered_rows = registered_result.data or []
+        registered_rows = getattr(registered_result, "data", None) if registered_result is not None else None
+        if registered_rows is None:
+            raise RuntimeError("Supabase returned no response while reading factory_meters")
         registered_ids = {int(row["slave_id"]) for row in registered_rows}
         meter_names = {
             int(row["slave_id"]): str(row.get("meter_name") or f"Meter {row['slave_id']}")
