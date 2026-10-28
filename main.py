@@ -35,7 +35,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 HIGH_CURRENT_LIMIT_A = float(os.getenv("HIGH_CURRENT_LIMIT_A", "100"))
 LOW_VOLTAGE_LIMIT_V = float(os.getenv("LOW_VOLTAGE_LIMIT_V", "200"))
 HIGH_VOLTAGE_LIMIT_V = float(os.getenv("HIGH_VOLTAGE_LIMIT_V", "250"))
-METER_OFFLINE_SECONDS = int(os.getenv("METER_OFFLINE_SECONDS", "120"))
+METER_OFFLINE_SECONDS = int(os.getenv("METER_OFFLINE_SECONDS", "1800"))
 
 
 # --------------------------------------------------
@@ -496,7 +496,7 @@ def admin_stats(
         with storage_lock:
             readings = list(latest_meters.values())
 
-        online_cutoff = datetime.now(timezone.utc) - timedelta(seconds=120)
+        online_cutoff = datetime.now(timezone.utc) - timedelta(seconds=METER_OFFLINE_SECONDS)
         online_keys = set()
         for reading in readings:
             key = (str(reading.get("factory_id")), int(reading.get("slave_id", 0)))
@@ -880,7 +880,7 @@ def list_admin_meters(
             readings_by_key = dict(latest_meters)
 
         now = datetime.now(timezone.utc)
-        online_cutoff = now - timedelta(seconds=120)
+        online_cutoff = now - timedelta(seconds=METER_OFFLINE_SECONDS)
         output = []
         for row in registered:
             factory_id = str(row["factory_id"])
@@ -1267,7 +1267,7 @@ def get_customer_factories(
             readings_by_key = dict(latest_meters)
 
         now = datetime.now(timezone.utc)
-        online_cutoff = now - timedelta(seconds=120)
+        online_cutoff = now - timedelta(seconds=METER_OFFLINE_SECONDS)
         meters_by_factory: dict[str, list[dict[str, Any]]] = {
             str(factory_id): [] for factory_id in factory_ids
         }
