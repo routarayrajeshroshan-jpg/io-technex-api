@@ -6,6 +6,7 @@ from functools import lru_cache
 from typing import Any
 from uuid import UUID
 import math
+import traceback
 
 import jwt
 from jwt import PyJWKClient
@@ -516,7 +517,8 @@ def admin_stats(
     except HTTPException:
         raise
     except Exception as error:
-        print(f"Dashboard statistics error: {error}")
+        print(f"Dashboard statistics error: {type(error).__name__}: {error}")
+        traceback.print_exc()
         raise HTTPException(
             status_code=503,
             detail="Unable to retrieve dashboard statistics",
@@ -702,7 +704,8 @@ def list_factories(
 
         return {"factories": output, "count": len(output)}
     except Exception as error:
-        print(f"List factories error: {error}")
+        print(f"List factories error: {type(error).__name__}: {error}")
+        traceback.print_exc()
         raise HTTPException(
             status_code=503,
             detail="Unable to retrieve factories. Check factories, factory_users, profiles, and Supabase Auth configuration.",
@@ -911,7 +914,8 @@ def list_admin_meters(
     except HTTPException:
         raise
     except Exception as error:
-        print(f"List meters error: {error}")
+        print(f"List meters error: {type(error).__name__}: {error}")
+        traceback.print_exc()
         raise HTTPException(
             status_code=503,
             detail="Unable to retrieve meters. Check factory_meters and factories tables.",
@@ -1309,7 +1313,8 @@ def list_alarm_settings(
     except HTTPException:
         raise
     except Exception as error:
-        print(f"List alarm settings error: {error}")
+        print(f"List alarm settings error: {type(error).__name__}: {error}")
+        traceback.print_exc()
         raise HTTPException(status_code=503, detail="Unable to retrieve alarm settings. Run the alarm_settings SQL migration first.")
 
 
